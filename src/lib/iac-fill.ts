@@ -84,6 +84,10 @@ const FIELD_POSITIONS: Record<string, TextFieldPosition> = {
   "Date Tendered": { xpx: 320, placement: "after-label", topPx: 1954 },
 };
 
+// This field must be completed at tender time, so generated IAC forms leave it
+// blank instead of copying a ticket flight date or writing "N/A".
+const BLANK_TEXT_FIELDS = new Set(["Date Tendered"]);
+
 // Yes/No questions, keyed by label. Each option is the right edge of its printed
 // word and the line's vertical centre; the X is stamped just after the word.
 type Point = { rightXpx: number; ypx: number };
@@ -156,19 +160,16 @@ export function ticketToIacValues(
     "Flight Number",
     southwestFlights?.summary.flightNumbersCompact ?? field("Flight Number"),
   );
-  set(
-    "Date Tendered",
-    southwestFlights?.summary.tenderDates ?? field("Flight Date"),
-  );
 
   // Known DHL Same Day personnel.
   const representativeName = AUTHORIZED_REPRESENTATIVE_NAMES[carrier];
   set("Authorized Representative / Driver's Name", representativeName);
   set("Name of IAC employee who verified ID", representativeName);
 
-  // Remaining text fields are completed by the driver at pickup; leave none blank.
+  // Remaining text fields are completed by the driver at pickup; use "N/A"
+  // except for fields that must stay blank until tender time.
   for (const label of Object.keys(FIELD_POSITIONS)) {
-    if (!out[label]) out[label] = "N/A";
+    if (!out[label] && !BLANK_TEXT_FIELDS.has(label)) out[label] = "N/A";
   }
 
   // Yes/No answers. "Any items under 16 oz (453.6 g)?" is a property of the

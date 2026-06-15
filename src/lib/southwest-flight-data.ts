@@ -18,7 +18,6 @@ export type SouthwestFlightData = {
     flightDates: string | null;
     flightNumbers: string | null;
     flightNumbersCompact: string | null;
-    tenderDates: string | null;
   };
 };
 
@@ -56,15 +55,6 @@ function splitCompoundValue(value: string | null): string[] {
 function airlineName(code: string | null): string | null {
   if (!code) return null;
   return AIRLINE_NAMES[code.toUpperCase()] ?? code;
-}
-
-function formatTenderDate(value: string | null): string | null {
-  if (!value) return null;
-  const iso = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (iso) return `${iso[2]}/${iso[3]}/${iso[1].slice(-2)}`;
-  const slash = value.match(/^(\d{2})\/(\d{2})\/(\d{2}|\d{4})$/);
-  if (!slash) return value;
-  return `${slash[1]}/${slash[2]}/${slash[3].slice(-2)}`;
 }
 
 function joinValues(
@@ -150,10 +140,6 @@ export function identifySouthwestFlightData(
       flightNumbersCompact: joinValues(
         legs.map((leg) => leg.flightNumber),
         "/",
-      ),
-      tenderDates: joinValues(
-        legs.map((leg) => formatTenderDate(leg.flightDate)),
-        " / ",
       ),
     },
   };
