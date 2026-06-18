@@ -119,6 +119,69 @@ function downloadBlob(blob: Blob, filename: string) {
   URL.revokeObjectURL(url);
 }
 
+// Document types that can be submitted to the Skyline Axis API as a new
+// shipment/order. Keep in sync with AXIS_SUBMITTABLE_TYPES in lib/axis-map.
+const AXIS_SUBMITTABLE_TYPES = new Set(["dhl-sameday-ticket"]);
+
+function canSubmitAxis(result: FileResult): result is FillableResult {
+  return Boolean(
+    result.ok && result.mapping && AXIS_SUBMITTABLE_TYPES.has(result.mapping.type),
+  );
+}
+
+type AxisSubmitResult = {
+  ok: boolean;
+  submitted?: number;
+  ordersCreated?: Array<string | number>;
+  skipped?: string[];
+};
+
+// Submit parsed mappings to the Axis API as new orders. Resolves with the ids
+// of the created orders, or throws with the server's error message.
+async function submitMappingsToAxis(
+  mappings: DocumentMapping[],
+): Promise<AxisSubmitResult> {
+  const res = await fetch("/api/axis-submit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mappings }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ?? "Failed to submit to Axis.");
+  return data as AxisSubmitResult;
+}
+
+type AxisPreview = {
+  dryRun: true;
+  endpoint: string;
+  orders: unknown[];
+  skipped: string[];
+  placeholders: string[];
+};
+
+// Build (but do not send) the order payload for a mapping, to preview the exact
+// JSON that would be POSTed to Axis. No authentication required.
+async function previewAxisOrder(mapping: DocumentMapping): Promise<AxisPreview> {
+  const res = await fetch("/api/axis-submit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mappings: [mapping], dryRun: true }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ?? "Failed to build preview.");
+  return data as AxisPreview;
+}
+
+// Human-readable summary of a submit response, e.g. "Submitted 2 · orders 1001, 1002".
+function axisSummary(data: AxisSubmitResult, fallbackCount: number): string {
+  const ids = data.ordersCreated ?? [];
+  const count = data.submitted ?? fallbackCount;
+  return (
+    `Submitted ${count} to Axis` +
+    (ids.length ? ` · order${ids.length > 1 ? "s" : ""} ${ids.join(", ")}` : "")
+  );
+}
+
 function isPdf(file: File, path: string) {
   return file.type === "application/pdf" || path.toLowerCase().endsWith(".pdf");
 }
@@ -221,6 +284,32 @@ export default function Home() {
     setDownloadingAwbs(false);
   }, [results, carrier]);
 
+  const [submittingAxis, setSubmittingAxis] = useState(false);
+  const [axisMsg, setAxisMsg] = useState<string | null>(null);
+  const [axisError, setAxisError] = useState<string | null>(null);
+  // Bumping this re-fetches the "today's orders" list (after each submission).
+  const [ordersRefreshKey, setOrdersRefreshKey] = useState(0);
+  const refreshOrders = useCallback(() => setOrdersRefreshKey((k) => k + 1), []);
+
+  // Parsed tickets that can be turned into Axis orders.
+  const axisResults = results.filter(canSubmitAxis);
+
+  const submitAllToAxis = useCallback(async () => {
+    setSubmittingAxis(true);
+    setAxisMsg(null);
+    setAxisError(null);
+    try {
+      const mappings = results.filter(canSubmitAxis).map((r) => r.mapping);
+      const data = await submitMappingsToAxis(mappings);
+      setAxisMsg(axisSummary(data, mappings.length));
+      refreshOrders();
+    } catch (err) {
+      setAxisError(err instanceof Error ? err.message : "Failed to submit to Axis.");
+    } finally {
+      setSubmittingAxis(false);
+    }
+  }, [results, refreshOrders]);
+
   const okCount = results.filter((r) => r.ok).length;
   const failCount = results.length - okCount;
 
@@ -289,17 +378,169 @@ export default function Home() {
                     : `Download all filled forms (${awbResults.length})`}
                 </button>
               )}
+              {axisResults.length > 0 && (
+                <button
+                  onClick={submitAllToAxis}
+                  disabled={submittingAxis}
+                  className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
+                >
+                  {submittingAxis
+                    ? "Submitting…"
+                    : `Submit all to Axis (${axisResults.length})`}
+                </button>
+              )}
             </div>
           </div>
+          {(axisMsg || axisError) && (
+            <div
+              className={`mb-4 rounded-lg border px-4 py-2 text-sm ${
+                axisError
+                  ? "border-red-300 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400"
+                  : "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-400"
+              }`}
+            >
+              {axisError ?? axisMsg}
+            </div>
+          )}
 
           <div className="space-y-3">
             {results.map((r, i) => (
-              <FileCard key={`${r.fileName}-${i}`} result={r} carrier={carrier} />
+              <FileCard
+                key={`${r.fileName}-${i}`}
+                result={r}
+                carrier={carrier}
+                onAxisSubmitted={refreshOrders}
+              />
             ))}
           </div>
         </section>
       )}
+
+      <TodaysOrders refreshKey={ordersRefreshKey} />
     </main>
+  );
+}
+
+type TodaysOrder = {
+  orderTrackingId: string;
+  submittedAt: string;
+  clientRefNo?: string;
+  clientRefNo2?: string;
+  pickup?: string;
+  delivery?: string;
+  accountNo?: string;
+};
+
+// Persistent list of orders this app has submitted to Axis today. Backed by the
+// server-side order log (/api/axis-orders), so it survives reloads and restarts.
+function TodaysOrders({ refreshKey }: { refreshKey: number }) {
+  const [orders, setOrders] = useState<TodaysOrder[]>([]);
+  const [day, setDay] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Pure fetch — no setState, so it's safe to call from an effect.
+  const fetchOrders = useCallback(async () => {
+    const res = await fetch("/api/axis-orders");
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error ?? "Failed to load orders.");
+    return { orders: (data.orders as TodaysOrder[]) ?? [], day: data.day ?? null };
+  }, []);
+
+  // Manual refresh (event handler) — setState here is fine.
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await fetchOrders();
+      setOrders(data.orders);
+      setDay(data.day);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load orders.");
+    } finally {
+      setLoading(false);
+    }
+  }, [fetchOrders]);
+
+  // Initial load and reload on submit. State is only set in async callbacks.
+  useEffect(() => {
+    let active = true;
+    fetchOrders()
+      .then((data) => {
+        if (!active) return;
+        setOrders(data.orders);
+        setDay(data.day);
+      })
+      .catch((err) => {
+        if (active) {
+          setError(err instanceof Error ? err.message : "Failed to load orders.");
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [fetchOrders, refreshKey]);
+
+  const time = (iso: string) =>
+    new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  return (
+    <section className="mt-12 border-t border-gray-200 pt-8 dark:border-gray-800">
+      <div className="mb-4 flex items-center justify-between gap-3">
+        <h2 className="text-lg font-semibold">
+          Today&apos;s Axis orders
+          <span className="ml-2 text-sm font-normal text-gray-500">
+            {day ? `(${day}) · ` : ""}
+            {orders.length}
+          </span>
+        </h2>
+        <button
+          onClick={load}
+          disabled={loading}
+          className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium hover:bg-gray-50 disabled:opacity-60 dark:border-gray-700 dark:hover:bg-gray-800"
+        >
+          {loading ? "Refreshing…" : "Refresh"}
+        </button>
+      </div>
+
+      {error && (
+        <p className="mb-3 text-sm text-red-600 dark:text-red-400">{error}</p>
+      )}
+
+      {orders.length === 0 ? (
+        <p className="text-sm text-gray-500">
+          No orders submitted to Axis today yet. Submitting a parsed ticket adds
+          it here.
+        </p>
+      ) : (
+        <div className="overflow-hidden rounded-lg border border-gray-200 dark:border-gray-800">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500 dark:bg-gray-900">
+              <tr>
+                <th className="px-3 py-2 font-medium">Order #</th>
+                <th className="px-3 py-2 font-medium">Time</th>
+                <th className="px-3 py-2 font-medium">Reference</th>
+                <th className="px-3 py-2 font-medium">Pickup → Delivery</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-200 dark:divide-gray-800">
+              {orders.map((o, i) => (
+                <tr key={`${o.orderTrackingId}-${i}`}>
+                  <td className="px-3 py-2 font-medium">{o.orderTrackingId}</td>
+                  <td className="px-3 py-2 text-gray-500">{time(o.submittedAt)}</td>
+                  <td className="px-3 py-2">
+                    {o.clientRefNo || o.clientRefNo2 || "—"}
+                  </td>
+                  <td className="px-3 py-2 text-gray-500">
+                    {[o.pickup, o.delivery].filter(Boolean).join(" → ") || "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -411,14 +652,59 @@ function DropZone({
 function FileCard({
   result,
   carrier,
+  onAxisSubmitted,
 }: {
   result: FileResult;
   carrier: Carrier;
+  onAxisSubmitted?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [filling, setFilling] = useState(false);
   const [fillError, setFillError] = useState<string | null>(null);
+  const [submittingAxis, setSubmittingAxis] = useState(false);
+  const [axisMsg, setAxisMsg] = useState<string | null>(null);
+  const [axisError, setAxisError] = useState<string | null>(null);
+
+  // Tickets carry a full shipment and can be pushed to Axis as a new order.
+  const submittable = canSubmitAxis(result);
+
+  const submitAxis = useCallback(async () => {
+    if (!canSubmitAxis(result)) return;
+    setSubmittingAxis(true);
+    setAxisMsg(null);
+    setAxisError(null);
+    try {
+      const data = await submitMappingsToAxis([result.mapping]);
+      setAxisMsg(axisSummary(data, 1));
+      onAxisSubmitted?.();
+    } catch (err) {
+      setAxisError(err instanceof Error ? err.message : "Unexpected error.");
+    } finally {
+      setSubmittingAxis(false);
+    }
+  }, [result, onAxisSubmitted]);
+
+  const [axisPreview, setAxisPreview] = useState<string | null>(null);
+  const previewAxis = useCallback(async () => {
+    if (!canSubmitAxis(result)) return;
+    if (axisPreview) {
+      setAxisPreview(null); // toggle off
+      return;
+    }
+    setAxisError(null);
+    try {
+      const data = await previewAxisOrder(result.mapping);
+      setAxisPreview(JSON.stringify(data.orders, null, 2));
+      if (data.placeholders.length) {
+        setAxisMsg(
+          `Preview only — ${data.placeholders.join(" & ")} shown as 0 until set in .env.local`,
+        );
+      }
+    } catch (err) {
+      setAxisError(err instanceof Error ? err.message : "Unexpected error.");
+    }
+  }, [result, axisPreview]);
 
   // Documents we know how to map onto the Air Waybill form.
   const fillable = canFillAwb(result);
@@ -523,10 +809,43 @@ function FileCard({
             {filling ? "Generating…" : fillLabel}
           </button>
         )}
+        {submittable && (
+          <>
+            <button
+              onClick={previewAxis}
+              className="shrink-0 rounded-md border border-emerald-600 px-3 py-1.5 text-sm font-medium text-emerald-700 hover:bg-emerald-50 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
+            >
+              {axisPreview ? "Hide preview" : "Preview Axis order"}
+            </button>
+            <button
+              onClick={submitAxis}
+              disabled={submittingAxis}
+              className="shrink-0 rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
+            >
+              {submittingAxis ? "Submitting…" : "Submit to Axis"}
+            </button>
+          </>
+        )}
       </div>
+      {axisPreview && (
+        <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap border-t border-gray-200 bg-gray-50 p-4 text-xs dark:border-gray-800 dark:bg-gray-900">
+          {axisPreview}
+        </pre>
+      )}
       {fillError && (
         <p className="border-t border-gray-200 px-4 py-2 text-sm text-red-600 dark:border-gray-800 dark:text-red-400">
           {fillError}
+        </p>
+      )}
+      {(axisMsg || axisError) && (
+        <p
+          className={`border-t px-4 py-2 text-sm ${
+            axisError
+              ? "border-gray-200 text-red-600 dark:border-gray-800 dark:text-red-400"
+              : "border-gray-200 text-emerald-600 dark:border-gray-800 dark:text-emerald-400"
+          }`}
+        >
+          {axisError ?? axisMsg}
         </p>
       )}
 
