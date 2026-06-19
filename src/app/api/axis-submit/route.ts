@@ -21,6 +21,7 @@ export const runtime = "nodejs";
 export async function POST(req: NextRequest) {
   let mappings: DocumentMapping[];
   let dryRun = false;
+  let mode: "air-tender" | "normal" = "air-tender";
   try {
     const body = await req.json();
     mappings = Array.isArray(body.mappings)
@@ -29,6 +30,9 @@ export async function POST(req: NextRequest) {
         ? [body.mapping]
         : [];
     dryRun = body.dryRun === true;
+    // "normal" orders keep the ticket's actual pickup/delivery; anything else
+    // (default) runs the air-tender hub redirect.
+    if (body.mode === "normal") mode = "normal";
   } catch {
     return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
   }
@@ -52,6 +56,7 @@ export async function POST(req: NextRequest) {
       vehicleId: cfg.vehicleId ?? 0,
       packageId: cfg.packageId ?? 0,
       caller: cfg.caller,
+      mode,
     };
     const previewOrders = [];
     const previewSkipped: string[] = [];
@@ -114,6 +119,7 @@ export async function POST(req: NextRequest) {
       vehicleId,
       packageId: cfg.packageId ?? 0,
       caller: cfg.caller,
+      mode,
     };
 
     const orders = submittable

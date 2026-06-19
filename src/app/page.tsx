@@ -58,6 +58,10 @@ function downloadName(path: string) {
 }
 
 type Carrier = "southwest" | "delta";
+// Drop-zone workflow. Southwest/Delta are air-tender (fill AWB/IAC, redirect
+// delivery to the airline counter); "normal" is a plain pickup -> delivery
+// order with the ticket's actual addresses and no AWB/IAC.
+type Workflow = Carrier | "normal";
 
 // Download name for the filled PDF, by carrier workflow. Southwest yields the
 // merged Air Waybill + IAC; Delta yields the IAC only. For Southwest we name the
@@ -136,15 +140,20 @@ type AxisSubmitResult = {
   skipped?: string[];
 };
 
+// Axis order workflow: "air-tender" (Southwest/Delta) redirects delivery to the
+// airline counter; "normal" keeps the ticket's actual pickup/delivery.
+type AxisMode = "air-tender" | "normal";
+
 // Submit parsed mappings to the Axis API as new orders. Resolves with the ids
 // of the created orders, or throws with the server's error message.
 async function submitMappingsToAxis(
   mappings: DocumentMapping[],
+  mode: AxisMode = "air-tender",
 ): Promise<AxisSubmitResult> {
   const res = await fetch("/api/axis-submit", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mappings }),
+    body: JSON.stringify({ mappings, mode }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error ?? "Failed to submit to Axis.");
@@ -161,11 +170,14 @@ type AxisPreview = {
 
 // Build (but do not send) the order payload for a mapping, to preview the exact
 // JSON that would be POSTed to Axis. No authentication required.
-async function previewAxisOrder(mapping: DocumentMapping): Promise<AxisPreview> {
+async function previewAxisOrder(
+  mapping: DocumentMapping,
+  mode: AxisMode = "air-tender",
+): Promise<AxisPreview> {
   const res = await fetch("/api/axis-submit", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mappings: [mapping], dryRun: true }),
+    body: JSON.stringify({ mappings: [mapping], dryRun: true, mode }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error ?? "Failed to build preview.");
@@ -225,11 +237,17 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<FileResult[]>([]);
-  // Carrier of the most recent upload, set by which drop zone was used.
-  const [carrier, setCarrier] = useState<Carrier>("southwest");
+  // Workflow of the most recent upload, set by which drop zone was used.
+  const [workflow, setWorkflow] = useState<Workflow>("southwest");
+  // Air-tender workflows fill AWB/IAC; "normal" doesn't. The PDF-fill helpers
+  // only accept a Carrier, so map "normal" onto a harmless default (unused, as
+  // the fill UI is hidden for normal orders).
+  const isAirTender = workflow !== "normal";
+  const carrier: Carrier = workflow === "delta" ? "delta" : "southwest";
+  const axisMode: AxisMode = workflow === "normal" ? "normal" : "air-tender";
 
   const handleFiles = useCallback(
-    async (picked: PickedFile[], chosen: Carrier) => {
+    async (picked: PickedFile[], chosen: Workflow) => {
       if (picked.length === 0) return;
       const pdfs = picked.filter(({ file, path }) => isPdf(file, path));
       if (pdfs.length === 0) {
@@ -239,7 +257,7 @@ export default function Home() {
       }
       setError(null);
       setResults([]);
-      setCarrier(chosen);
+      setWorkflow(chosen);
       setLoading(true);
       try {
         const formData = new FormData();
@@ -263,8 +281,9 @@ export default function Home() {
   const [downloadingAwbs, setDownloadingAwbs] = useState(false);
   const [awbError, setAwbError] = useState<string | null>(null);
 
-  // Every parsed fillable document can produce one or more filled forms.
-  const awbResults = results.filter(canFillAwb);
+  // Every parsed fillable document can produce one or more filled forms — but
+  // only in an air-tender workflow (normal orders don't generate AWB/IAC).
+  const awbResults = isAirTender ? results.filter(canFillAwb) : [];
 
   const downloadAllAwbs = useCallback(async () => {
     setDownloadingAwbs(true);
@@ -300,7 +319,7 @@ export default function Home() {
     setAxisError(null);
     try {
       const mappings = results.filter(canSubmitAxis).map((r) => r.mapping);
-      const data = await submitMappingsToAxis(mappings);
+      const data = await submitMappingsToAxis(mappings, axisMode);
       setAxisMsg(axisSummary(data, mappings.length));
       refreshOrders();
     } catch (err) {
@@ -308,7 +327,7 @@ export default function Home() {
     } finally {
       setSubmittingAxis(false);
     }
-  }, [results, refreshOrders]);
+  }, [results, refreshOrders, axisMode]);
 
   const okCount = results.filter((r) => r.ok).length;
   const failCount = results.length - okCount;
@@ -323,7 +342,7 @@ export default function Home() {
         </p>
       </header>
 
-      <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid gap-4 sm:grid-cols-3">
         <DropZone
           title="Southwest"
           subtitle="Fills Air Waybill + IAC"
@@ -333,6 +352,11 @@ export default function Home() {
           title="Delta"
           subtitle="Fills DHL IAC only"
           onFiles={(picked) => handleFiles(picked, "delta")}
+        />
+        <DropZone
+          title="Normal order"
+          subtitle="Pickup → delivery as-is (no AWB/IAC)"
+          onFiles={(picked) => handleFiles(picked, "normal")}
         />
       </div>
 
@@ -409,6 +433,8 @@ export default function Home() {
                 key={`${r.fileName}-${i}`}
                 result={r}
                 carrier={carrier}
+                airTender={isAirTender}
+                axisMode={axisMode}
                 onAxisSubmitted={refreshOrders}
               />
             ))}
@@ -652,10 +678,14 @@ function DropZone({
 function FileCard({
   result,
   carrier,
+  airTender,
+  axisMode,
   onAxisSubmitted,
 }: {
   result: FileResult;
   carrier: Carrier;
+  airTender: boolean;
+  axisMode: AxisMode;
   onAxisSubmitted?: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -675,7 +705,7 @@ function FileCard({
     setAxisMsg(null);
     setAxisError(null);
     try {
-      const data = await submitMappingsToAxis([result.mapping]);
+      const data = await submitMappingsToAxis([result.mapping], axisMode);
       setAxisMsg(axisSummary(data, 1));
       onAxisSubmitted?.();
     } catch (err) {
@@ -683,7 +713,7 @@ function FileCard({
     } finally {
       setSubmittingAxis(false);
     }
-  }, [result, onAxisSubmitted]);
+  }, [result, axisMode, onAxisSubmitted]);
 
   const [axisPreview, setAxisPreview] = useState<string | null>(null);
   const previewAxis = useCallback(async () => {
@@ -694,7 +724,7 @@ function FileCard({
     }
     setAxisError(null);
     try {
-      const data = await previewAxisOrder(result.mapping);
+      const data = await previewAxisOrder(result.mapping, axisMode);
       setAxisPreview(JSON.stringify(data.orders, null, 2));
       if (data.placeholders.length) {
         setAxisMsg(
@@ -704,10 +734,11 @@ function FileCard({
     } catch (err) {
       setAxisError(err instanceof Error ? err.message : "Unexpected error.");
     }
-  }, [result, axisPreview]);
+  }, [result, axisPreview, axisMode]);
 
-  // Documents we know how to map onto the Air Waybill form.
-  const fillable = canFillAwb(result);
+  // Documents we know how to map onto the Air Waybill form — air-tender only;
+  // normal orders don't generate AWB/IAC.
+  const fillable = airTender && canFillAwb(result);
   // The carrier (chosen by drop zone) decides the output: Southwest = Air
   // Waybill + IAC, Delta = IAC only. A standalone IAC just fills the Air Waybill.
   const isTicket = result.ok && result.mapping?.type === "dhl-sameday-ticket";

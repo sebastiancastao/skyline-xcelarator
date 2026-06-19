@@ -13,6 +13,15 @@ import { identifySouthwestFlightData } from "./southwest-flight-data";
 // ticket carries a full shipment; the IAC certification does not.
 export const AXIS_SUBMITTABLE_TYPES = new Set(["dhl-sameday-ticket"]);
 
+/**
+ * Workflow that produced the order:
+ * - "air-tender" (Southwest/Delta zones): redirect delivery to the airline
+ *   cargo counter and set the delivery target to the flight tender cutoff.
+ * - "normal" (Normal-order zone): a plain pickup -> delivery using the ticket's
+ *   actual addresses (e.g. recover at Southwest, deliver to Truist Park).
+ */
+export type AxisOrderMode = "air-tender" | "normal";
+
 /** Order-field defaults that come from configuration, not the document. */
 export type AxisOrderDefaults = {
   accountNo: string;
@@ -22,6 +31,8 @@ export type AxisOrderDefaults = {
   packageId?: number;
   caller?: string;
   orderType?: SubmitOrderV4Request["OrderType"];
+  /** Defaults to "air-tender" to preserve the existing NCR/airline behavior. */
+  mode?: AxisOrderMode;
 };
 
 // Look up a mapped field's value by label, returning null when absent/blank.
@@ -201,7 +212,7 @@ function airlineDeliveryInstr(
           : "";
       const flightCode = leg.flightNumber ? `${code}${leg.flightNumber}` : code || null;
       const isLast = i === legs.length - 1;
-      const parts = [flightCode, leg.departureTime, leg.destination];
+      const parts = [flightCode, leg.destination];
       if (includeAwb && isLast && leg.airWaybillNumber) parts.push(leg.airWaybillNumber);
       const line = joinSlash(parts);
       if (!line) return null;
@@ -210,36 +221,6 @@ function airlineDeliveryInstr(
     .filter((l): l is string => Boolean(l));
 
   return lines.length ? lines.join("\n") : undefined;
-}
-
-// Cargo must be tendered to the airline counter before the flight; the delivery
-// target is the first flight's departure minus this many minutes (matching the
-// manual orders: 08:55 flight -> 07:55 delivery; 09:12 -> 08:12).
-const CARGO_CUTOFF_MINUTES = 60;
-
-function pad2(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
-// Delivery target = first flight's (date + ETD) minus the cargo cutoff, as a
-// portal "MM/DD/YYYY HH:MM" wall-clock string. No timezone conversion: the
-// ticket's local times are used as-is. Undefined when the flight time is unknown.
-function flightDeliveryTarget(mapping: DocumentMapping): string | undefined {
-  const data = identifySouthwestFlightData(mapping);
-  const leg = data?.legs.find((l) => l.departureTime && l.flightDate);
-  if (!leg?.departureTime || !leg.flightDate) return undefined;
-  const d = leg.flightDate.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  const t = leg.departureTime.match(/^(\d{1,2}):(\d{2})/);
-  if (!d || !t) return undefined;
-  // Arithmetic via UTC fields so subtracting the cutoff can't shift by a DST hour.
-  const at = new Date(
-    Date.UTC(Number(d[1]), Number(d[2]) - 1, Number(d[3]), Number(t[1]), Number(t[2])) -
-      CARGO_CUTOFF_MINUTES * 60_000,
-  );
-  return (
-    `${pad2(at.getUTCMonth() + 1)}/${pad2(at.getUTCDate())}/${at.getUTCFullYear()} ` +
-    `${pad2(at.getUTCHours())}:${pad2(at.getUTCMinutes())}`
-  );
 }
 
 /**
@@ -267,10 +248,11 @@ export function mappingToAxisOrder(
     VehicleId: defaults.vehicleId,
     Caller: defaults.caller,
 
-    // Reference numbers, most specific first.
-    ClientRefNo: reference ?? awb ?? ticket ?? undefined,
+    // Reference numbers. Ref#1 (client ref) carries the DHL ticket /
+    // confirmation number; the customer Reference# goes to Ref#3.
+    ClientRefNo: ticket ?? reference ?? awb ?? undefined,
     ClientRefNo2: awb ?? undefined,
-    ClientRefNo3: ticket ?? undefined,
+    ClientRefNo3: reference ?? undefined,
     ClientRefNo4: partNumber ?? undefined,
 
     // Pickup = shipper.
@@ -306,8 +288,13 @@ export function mappingToAxisOrder(
   // Air-cargo routing (Delta, Southwest, …): the delivery stop is the airline's
   // cargo counter, not the shipment's final consignee. Redirect the delivery
   // address to the airline hub and carry the flight legs (and AWB, for Delta)
-  // in the delivery special instructions.
-  const hub = CARGO_HUBS[routingCarrierCode(mapping) ?? ""];
+  // in the delivery special instructions. Skipped for "normal" orders, which
+  // keep the ticket's actual pickup/delivery (e.g. recover at Southwest, deliver
+  // to a local address).
+  const hub =
+    defaults.mode === "normal"
+      ? undefined
+      : CARGO_HUBS[routingCarrierCode(mapping) ?? ""];
   if (hub) {
     order.DCoName = hub.coName;
     order.DContact = undefined;
@@ -319,13 +306,6 @@ export function mappingToAxisOrder(
     order.DState = hub.state;
     order.DZip = hub.zip;
     order.DSpecInstr = airlineDeliveryInstr(mapping, hub.includeAwb) ?? order.DSpecInstr;
-
-    // Delivery target is the flight's tender cutoff, not a "now + window" time.
-    const target = flightDeliveryTarget(mapping);
-    if (target) {
-      order.DeliveryTargetFrom = target;
-      order.DeliveryTargetTo = target;
-    }
   }
 
   // Weight / dimensions live on a package item, which needs a package-type id.

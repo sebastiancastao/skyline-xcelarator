@@ -68,13 +68,6 @@ export type SubmitOrderV4Request = {
   DZip?: string;
   DSpecInstr?: string;
   sValue?: number;
-  // Target pickup/delivery times ("MM/DD/YYYY HH:MM" or anything Date-parseable).
-  // When set they seed the portal's time validation instead of the default
-  // "now + window" — used to drive delivery from the flight tender cutoff.
-  PickupTargetFrom?: string;
-  PickupTargetTo?: string;
-  DeliveryTargetFrom?: string;
-  DeliveryTargetTo?: string;
   OrderPackageItems?: OrderPackageItemV4[];
 };
 
@@ -535,16 +528,8 @@ async function validateTimes(
   current?: Partial<PortalTimes>,
   pageInit = true,
 ): Promise<PortalTimes> {
-  // The order's own target times (e.g. a flight tender cutoff) override the
-  // default now+window; a prior validated `current` still takes precedence.
-  const orderSeed: Partial<PortalTimes> = {};
-  if (order.PickupTargetFrom) orderSeed.PickupTargetFrom = formatPortalDateTime(order.PickupTargetFrom);
-  if (order.PickupTargetTo) orderSeed.PickupTargetTo = formatPortalDateTime(order.PickupTargetTo);
-  if (order.DeliveryTargetFrom) orderSeed.DeliveryTargetFrom = formatPortalDateTime(order.DeliveryTargetFrom);
-  if (order.DeliveryTargetTo) orderSeed.DeliveryTargetTo = formatPortalDateTime(order.DeliveryTargetTo);
   const seed = {
     ...defaultPortalTimes(),
-    ...orderSeed,
     ...current,
   };
   const data = {

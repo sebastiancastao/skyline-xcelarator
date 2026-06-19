@@ -8,8 +8,6 @@ export type SouthwestFlightLeg = {
   carrierName: string | null;
   flightNumber: string | null;
   flightDate: string | null;
-  /** Departure time (ETD) for this leg, e.g. "08:55". */
-  departureTime: string | null;
   airWaybillNumber: string | null;
 };
 
@@ -111,11 +109,6 @@ export function identifySouthwestFlightData(
     "Airline Tendered",
     "Carrier",
   ]);
-  // Departure times are index-aligned with the flight numbers, so split without
-  // dropping blanks to keep positions.
-  const departureTimes = (field(mapping, "Flight Departure Times") ?? "")
-    .split(/\s*\/\s*/)
-    .map((t) => t.trim());
 
   const legs: SouthwestFlightLeg[] = Array.from({ length: legCount }, (_, i) => {
     const routingLeg = routingLegs[i];
@@ -129,7 +122,6 @@ export function identifySouthwestFlightData(
         airlineName(routingLeg?.carrierCode ?? null) ?? defaultCarrierName,
       flightNumber: flightNumbers[i] ?? null,
       flightDate: flightDates[i] ?? null,
-      departureTime: departureTimes[i] || null,
       airWaybillNumber:
         airWaybillNumbers[i] ??
         (airWaybillNumbers.length === 1 ? airWaybillNumbers[0] : null),

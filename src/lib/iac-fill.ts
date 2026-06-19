@@ -84,9 +84,11 @@ const FIELD_POSITIONS: Record<string, TextFieldPosition> = {
   "Date Tendered": { xpx: 320, placement: "after-label", topPx: 1954 },
 };
 
-// This field must be completed at tender time, so generated IAC forms leave it
-// blank instead of copying a ticket flight date or writing "N/A".
-const BLANK_TEXT_FIELDS = new Set(["Date Tendered"]);
+// Fields that stay blank rather than receiving the "N/A" placeholder when the
+// ticket can't supply them. "Date Tendered" is completed at tender time; the
+// "Master Air Waybill" is left blank when the order carries no AWB number (the
+// client asked not to print "N/A" in the tendering AWB field).
+const BLANK_TEXT_FIELDS = new Set(["Date Tendered", "Master Air Waybill"]);
 
 // Yes/No questions, keyed by label. Each option is the right edge of its printed
 // word and the line's vertical centre; the X is stamped just after the word.
@@ -124,6 +126,23 @@ const IAC_AIRLINE_NAMES: Record<IacWorkflowCarrier, string> = {
 
 const px = (v: number) => v / OCR_SCALE;
 
+// Normalize the Master Air Waybill value for the tendering section. The parsed
+// AWB can be a single number, several routing-leg AWBs joined with " / ", or a
+// placeholder ("N/A"/"NA"/"none"/blank). Drop the placeholders, dedupe repeated
+// AWBs, and rejoin with " / "; an empty result keeps the field blank (never
+// "N/A"). Splitting on " / " (whitespace-padded) avoids breaking "N/A" apart.
+function normalizeAwb(value: string | null | undefined): string {
+  if (value === null || value === undefined) return "";
+  const tokens = String(value)
+    .split(/\s+\/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => {
+      const low = t.toLowerCase();
+      return t !== "" && low !== "n/a" && low !== "na" && low !== "none";
+    });
+  return [...new Set(tokens)].join(" / ");
+}
+
 /**
  * Map a DHL SameDay dispatch-ticket mapping onto every IAC field, or null if the
  * document isn't a ticket. Text fields the ticket can't supply are set to "N/A";
@@ -153,7 +172,8 @@ export function ticketToIacValues(
   set("Printed name of individual cargo accepted from", CARGO_ACCEPTED_FROM_NAME);
   set("Shipper's Company Name", field("Customer"));
   set("Employer / Company Name", field("Vendor"));
-  set("Master Air Waybill", field("Air Waybill Number"));
+  // Real AWB(s) are rendered (deduped); a missing/"N/A" value leaves it blank.
+  set("Master Air Waybill", normalizeAwb(field("Air Waybill Number")));
   set("DHL Same Day Job #", field("Ticket Number"));
   set("Airline Tendered", IAC_AIRLINE_NAMES[carrier]);
   set(

@@ -283,8 +283,6 @@ type RoutingLeg = {
   carrier: string | null;
   flight: string | null;
   date: string | null;
-  /** Estimated time of departure ("ETD" column), e.g. "08:55". */
-  etd: string | null;
   des: string | null;
   awb: string | null;
 };
@@ -306,11 +304,9 @@ function parseRoutingLegs(text: string): RoutingLeg[] {
   const carriers: string[] = [];
   const flights: string[] = [];
   const dates: string[] = [];
-  const times: string[] = [];
   const awbs: string[] = [];
   for (const token of block.split(/\s+/)) {
     if (/^\d{2}\/\d{2}\/\d{2}$/.test(token)) dates.push(token);
-    else if (/^\d{1,2}:\d{2}$/.test(token)) times.push(token);
     else if (/^\d{6,}$/.test(token)) awbs.push(token);
     else if (/^[A-Z]{3}$/.test(token)) airports.push(token);
     else if (/^(?=[A-Z0-9]*[A-Z])[A-Z0-9]{2}$/.test(token)) carriers.push(token);
@@ -327,14 +323,11 @@ function parseRoutingLegs(text: string): RoutingLeg[] {
 
   const deps = airports.slice(0, legCount);
   const dests = airports.slice(Math.max(airports.length - legCount, legCount));
-  // The time columns are ETD then ETA, each holding one value per leg, so the
-  // first leg-count times are departures (ETD) and the rest are arrivals.
   return Array.from({ length: legCount }, (_, i) => ({
     dep: deps[i] ?? null,
     carrier: carriers[i] ?? null,
     flight: flights[i] ?? null,
     date: dates[i] ?? null,
-    etd: times[i] ?? null,
     des: dests[i] ?? null,
     awb: awbs[i] ?? null,
   }));
@@ -425,9 +418,6 @@ const DHL_SAMEDAY_TICKET: DocumentDefinition = {
       { label: "Airline Tendered", value: airlineName(firstLeg?.carrier ?? null) },
       { label: "Flight Number", value: joinLegs((l) => l.flight) },
       { label: "Flight Date", value: joinLegs((l) => isoFromYYMMDD(l.date)) },
-      // Departure time (ETD) per leg, e.g. "08:55 / 14:55", aligned with the
-      // flight numbers above.
-      { label: "Flight Departure Times", value: joinLegs((l) => l.etd) },
       {
         // Full requested routing, leg by leg, for the AWB's multi-leg boxes:
         // "DEP-DES CARRIER FLIGHT" per leg. A direct flight has a single leg.
