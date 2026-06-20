@@ -60,6 +60,29 @@ function parseDimensions(value: string | null): {
   return { length: parts[0], width: parts[1], height: parts[2] };
 }
 
+// USPS Publication 28 standard abbreviations for common street suffixes and
+// directionals (whole-word, case-insensitive). Dispatch tickets often print
+// the spelled-out form ("Road", "East"), but Axis's live address-verification
+// step expects the standardized form ("Rd", "E") and otherwise can reject an
+// address it can't match in its database.
+const USPS_STREET_ABBREVIATIONS: Record<string, string> = {
+  street: "St", avenue: "Ave", boulevard: "Blvd", road: "Rd", drive: "Dr",
+  lane: "Ln", court: "Ct", circle: "Cir", place: "Pl", parkway: "Pkwy",
+  highway: "Hwy", terrace: "Ter", trail: "Trl", square: "Sq", plaza: "Plz",
+  expressway: "Expy", freeway: "Fwy", turnpike: "Tpke", crossing: "Xing",
+  extension: "Ext", junction: "Jct",
+  north: "N", south: "S", east: "E", west: "W",
+  northeast: "NE", northwest: "NW", southeast: "SE", southwest: "SW",
+};
+
+function normalizeStreet(street: string | undefined): string | undefined {
+  if (!street) return street;
+  return street.replace(
+    /[A-Za-z]+/g,
+    (word) => USPS_STREET_ABBREVIATIONS[word.toLowerCase()] ?? word,
+  );
+}
+
 type ParsedAddress = {
   coName?: string;
   contact?: string;
@@ -273,8 +296,8 @@ export function mappingToAxisOrder(
     PCoName: pickup.coName,
     PContact: pickup.contact,
     PPhone: pickup.phone,
-    PStreet: pickup.street,
-    PStreet2: pickup.street2,
+    PStreet: normalizeStreet(pickup.street),
+    PStreet2: normalizeStreet(pickup.street2),
     PCity: pickup.city,
     PState: pickup.state,
     PZip: pickup.zip,
@@ -284,8 +307,8 @@ export function mappingToAxisOrder(
     DCoName: delivery.coName,
     DContact: delivery.contact,
     DPhone: delivery.phone,
-    DStreet: delivery.street,
-    DStreet2: delivery.street2,
+    DStreet: normalizeStreet(delivery.street),
+    DStreet2: normalizeStreet(delivery.street2),
     DCity: delivery.city,
     DState: delivery.state,
     DZip: delivery.zip,
