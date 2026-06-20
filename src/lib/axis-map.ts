@@ -122,8 +122,22 @@ function parseAddressBlock(raw: string | null): ParsedAddress {
     lines = lines.slice(0, cszIdx);
   }
 
-  // First remaining line is the company/name; the rest are street lines.
-  if (lines.length) {
+  // The street line is the one that actually looks like a street address
+  // ("123 Main St", "PO Box 42") — everything before it is the company/name,
+  // everything after (up to the city/state/zip line already removed above) is
+  // a second street line. Some blocks have no name line at all (the street is
+  // the very first line); treating line 0 as the name in that case would drop
+  // the real street entirely and send Axis a blank PStreet, which is exactly
+  // what makes its pickup-address validation fail.
+  const streetIdx = lines.findIndex((l) => /^\d|^p\.?o\.?\s*box\b/i.test(l));
+  if (streetIdx !== -1) {
+    if (streetIdx > 0) out.coName = lines.slice(0, streetIdx).join(", ");
+    const streetLines = lines.slice(streetIdx);
+    out.street = streetLines[0];
+    if (streetLines.length > 1) out.street2 = streetLines.slice(1).join(", ");
+  } else if (lines.length) {
+    // No line looks like a street; fall back to the previous heuristic
+    // (first line is the name, the rest are street lines).
     out.coName = lines[0];
     const streetLines = lines.slice(1);
     if (streetLines[0]) out.street = streetLines[0];
