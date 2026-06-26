@@ -23,7 +23,22 @@ export type DocumentMapping = {
   fields: MappedField[];
 };
 
-type MatchContext = { text: string; fileName: string };
+// Positional layout, used by templates whose meaning depends on *columns* (e.g.
+// a two-column "PICKUP | DELIVER TO" block that the flattened text merges onto a
+// single line). A cell is one positioned text fragment; a row is the fragments
+// sharing a visual line, left-to-right; a page is its rows, top-to-bottom. The
+// producer (the parse route) fills this from the PDF's text positions; OCR'd
+// scans have no layout and pass it through as undefined.
+export type LayoutCell = { x: number; text: string };
+export type LayoutRow = LayoutCell[];
+export type PageLayout = LayoutRow[];
+
+type MatchContext = {
+  text: string;
+  fileName: string;
+  /** Positional layout, one entry per page, when available. */
+  layout?: PageLayout[];
+};
 
 type DocumentDefinition = {
   type: string;
@@ -143,6 +158,83 @@ function normalizeVendorName(value: string | null): string | null {
   if (!value) return null;
   if (/skyline courier/i.test(value)) return "Skyline Courier & Logistics";
   return value;
+}
+
+// --- Column layout helpers --------------------------------------------------
+//
+// Some forms are laid out as side-by-side columns (e.g. shipper on the left,
+// consignee on the right). The flattened text glues each row's columns together
+// with a single space, which makes "9851 COMMERCE WAY 1600 M H JACKSON SERVICE"
+// impossible to split back into a left and a right address by text alone. The
+// positional layout keeps each fragment's x, so we recover the columns by
+// reading the header row's labels and assigning every data cell to the label at
+// or to its left.
+
+// The whole row's text, left-to-right, for locating a header by its labels.
+function rowText(row: LayoutRow): string {
+  return row.map((c) => c.text).join(" ");
+}
+
+// The header label a cell belongs to: the right-most header cell whose x is at
+// or to the left of the cell (a small tolerance absorbs sub-pixel drift).
+function columnLabel(header: LayoutRow, x: number): string {
+  let label = "";
+  for (const h of header) {
+    if (h.x <= x + 8) label = h.text;
+    else break;
+  }
+  return label;
+}
+
+// The page that holds a given template, found by a row that matches `headerRe`.
+function findPage(
+  layout: PageLayout[] | undefined,
+  headerRe: RegExp,
+): PageLayout | null {
+  if (!layout) return null;
+  return layout.find((page) => page.some((r) => headerRe.test(rowText(r)))) ?? null;
+}
+
+// Split the single data row beneath a header into { label: value } by column.
+function rowColumns(
+  page: PageLayout,
+  headerRe: RegExp,
+): Record<string, string> {
+  const hi = page.findIndex((r) => headerRe.test(rowText(r)));
+  if (hi < 0 || hi + 1 >= page.length) return {};
+  const header = [...page[hi]].sort((a, b) => a.x - b.x);
+  const parts: Record<string, string[]> = {};
+  for (const cell of page[hi + 1]) {
+    (parts[columnLabel(header, cell.x)] ??= []).push(cell.text);
+  }
+  return Object.fromEntries(
+    Object.entries(parts).map(([k, v]) => [k, v.join(" ")]),
+  );
+}
+
+// Collect the multi-row block beneath a header into { label: [line, …] } by
+// column, stopping before the first row that matches `stopRe`.
+function columnBlock(
+  page: PageLayout,
+  headerRe: RegExp,
+  stopRe: RegExp,
+): Record<string, string[]> {
+  const hi = page.findIndex((r) => headerRe.test(rowText(r)));
+  const out: Record<string, string[]> = {};
+  if (hi < 0) return out;
+  const header = [...page[hi]].sort((a, b) => a.x - b.x);
+  for (let i = hi + 1; i < page.length; i++) {
+    const row = page[i];
+    if (stopRe.test(rowText(row))) break;
+    const perCol: Record<string, string[]> = {};
+    for (const cell of row) {
+      (perCol[columnLabel(header, cell.x)] ??= []).push(cell.text);
+    }
+    for (const [label, cells] of Object.entries(perCol)) {
+      (out[label] ??= []).push(cells.join(" "));
+    }
+  }
+  return out;
 }
 
 // --- Known documents --------------------------------------------------------
@@ -445,10 +537,134 @@ const DHL_SAMEDAY_TICKET: DocumentDefinition = {
   },
 };
 
+// Compose an AIT address column (the lines of one column of the PICKUP /
+// DELIVER TO block) into a multi-line block that parseAddressBlock can read:
+// name / street(s) / "City ST ZIP", with the "Contact:" line turned into a
+// "Tel:" line and the redundant domestic country line dropped.
+function composeAitAddress(lines: string[] | undefined): string | null {
+  if (!lines) return null;
+  let phone: string | null = null;
+  const out: string[] = [];
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    const contact = line.match(/^contact:?\s*(.*)$/i);
+    if (contact) {
+      if (contact[1].trim()) phone = contact[1].trim();
+      continue;
+    }
+    if (/^(united states|usa)$/i.test(line)) continue; // drop domestic country
+    out.push(line);
+  }
+  if (phone) out.push(`Tel: ${phone}`);
+  return out.length ? out.join("\n") : null;
+}
+
+// An AIT Worldwide Logistics "Pickup Order" dispatch ticket. It carries the full
+// shipment (pickup, deliver-to, routing, cargo, references), so it maps directly
+// onto an Axis order. The PDF sometimes arrives behind an "Email Cover Sheet"
+// page and sometimes on its own — extraction keys off the page that holds the
+// ticket, not its page number.
+const AIT_PICKUP_ORDER: DocumentDefinition = {
+  type: "ait-pickup-order",
+  label: "AIT Worldwide Logistics Pickup Order",
+  match: ({ text, fileName }) => {
+    const flat = flatten(text).toLowerCase();
+    const name = fileName.toLowerCase();
+    let score = 0;
+    if (/pickup order/.test(flat)) score += 0.4;
+    if (/ait worldwide logistics/.test(flat)) score += 0.3;
+    if (/\bshipment\s+s\d+/.test(flat)) score += 0.2;
+    if (/\bconsol\s+c\d+/.test(flat)) score += 0.1;
+    if (/reference ait'?s shipment number/.test(flat)) score += 0.2;
+    if (/pickup order/.test(name)) score += 0.2;
+    return Math.min(score, 1);
+  },
+  extract: ({ text, layout }) => {
+    const flat = flatten(text);
+    const page = findPage(layout, /\bPICKUP\b.*\bDELIVER TO\b/);
+
+    // Two-column blocks (need positional layout to split the columns).
+    const addr = page
+      ? columnBlock(page, /\bPICKUP\b.*\bDELIVER TO\b/, /\bReady\b/)
+      : {};
+    const parties = page ? rowColumns(page, /\bSHIPPER\b\s+CONSIGNEE\b/) : {};
+    const route = page
+      ? rowColumns(page, /\bORIGIN\b.*\bDESTINATION\b/)
+      : {};
+    const goods = page
+      ? rowColumns(page, /\bGOODS DESCRIPTION\b.*\bMAWB\b/)
+      : {};
+    const flight = page
+      ? rowColumns(page, /\bMode\b.*\bCarrier\b.*\bLoad\b/)
+      : {};
+
+    // Cargo line ("3 CTN 75.000 LB 10.125 CF 18 18 18 IN").
+    const pkg = flat.match(
+      /PACKAGES\s+TYPE\b[\s\S]*?\b(\d+)\s+([A-Z]+)\s+([\d.]+)\s*LB\s+([\d.]+)\s*CF\s+(\d+)\s+(\d+)\s+(\d+)\s*IN/i,
+    );
+
+    const origin = route["ORIGIN"] ?? null;
+    const destination = route["DESTINATION"] ?? null;
+
+    return [
+      { label: "Shipment Number", value: capture(text, /\bSHIPMENT\s+(S\d+)/i) },
+      { label: "Consol Number", value: capture(text, /\bCONSOL\s+(C\d+)/i) },
+      {
+        label: "Order Date",
+        value: capture(text, /\bDATE\s+(\d{1,2}-[A-Za-z]{3}-\d{2}\s+\d{2}:\d{2})/),
+      },
+      { label: "Shipper", value: cleanValue(parties["SHIPPER"]) },
+      { label: "Consignee", value: cleanValue(parties["CONSIGNEE"]) },
+      { label: "Origin", value: cleanValue(origin) },
+      { label: "ETD", value: cleanValue(route["ETD"]) },
+      { label: "Destination", value: cleanValue(destination) },
+      { label: "ETA", value: cleanValue(route["ETA"]) },
+      { label: "Pickup Name and Address", value: composeAitAddress(addr["PICKUP"]) },
+      {
+        label: "Deliver To Name and Address",
+        value: composeAitAddress(addr["DELIVER TO"]),
+      },
+      {
+        label: "Ready",
+        value: capture(text, /\bReady\s+(\d{1,2}-[A-Za-z]{3}-\d{2}\s+\d{2}:\d{2})/i),
+      },
+      {
+        label: "Close",
+        value: capture(text, /\bClose\s+(\d{1,2}-[A-Za-z]{3}-\d{2}\s+\d{2}:\d{2})/i),
+      },
+      { label: "Mode", value: cleanValue(flight["Mode"]) },
+      { label: "Carrier", value: cleanValue(flight["Carrier"]) },
+      { label: "Flight / Date", value: cleanValue(flight["Flight / Date"]) },
+      { label: "Flight ETD", value: cleanValue(flight["ETD"]) },
+      { label: "Flight ETA", value: cleanValue(flight["ETA"]) },
+      {
+        label: "Order Ref",
+        value: capture(text, /SHIPPERS REFERENCE\s+Order Ref\s+([A-Za-z0-9][A-Za-z0-9-]*)/i),
+      },
+      {
+        label: "Goods Description",
+        value: cleanValue(goods["GOODS DESCRIPTION"]),
+      },
+      { label: "MAWB", value: cleanValue(goods["MAWB"]) },
+      { label: "HAWB", value: cleanValue(goods["HAWB"]) },
+      { label: "Pieces", value: pkg ? pkg[1] : null },
+      { label: "Package Type", value: pkg ? pkg[2] : null },
+      { label: "Gross Weight (lb)", value: pkg ? pkg[3] : null },
+      { label: "Volume", value: pkg ? `${pkg[4]} CF` : null },
+      {
+        label: "Dimensions (in)",
+        value: pkg ? `${pkg[5]} x ${pkg[6]} x ${pkg[7]}` : null,
+      },
+    ];
+  },
+};
+
 const DEFINITIONS: DocumentDefinition[] = [
   DHL_IAC,
   AWB_GUIDE,
   DHL_SAMEDAY_TICKET,
+  AIT_PICKUP_ORDER,
 ];
 
 const MIN_CONFIDENCE = 0.5;
@@ -460,8 +676,9 @@ const MIN_CONFIDENCE = 0.5;
 export function classifyAndMap(
   text: string,
   fileName: string,
+  layout?: PageLayout[],
 ): DocumentMapping | null {
-  const ctx: MatchContext = { text, fileName };
+  const ctx: MatchContext = { text, fileName, layout };
 
   let best: { def: DocumentDefinition; score: number } | null = null;
   for (const def of DEFINITIONS) {

@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@napi-rs/canvas": "^0.1.100",
+    "mailparser": "^3.9.11",
     "next": "16.2.7",
     "pdf-lib": "^1.17.1",
     "react": "19.2.4",
@@ -19,6 +20,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/mailparser": "^3.4.6",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

@@ -9,9 +9,12 @@ import type { DocumentMapping } from "./documents";
 import type { OrderPackageItemV4, SubmitOrderV4Request } from "./axis";
 import { identifySouthwestFlightData } from "./southwest-flight-data";
 
-// Document types we know how to turn into an Axis order. Only the dispatch
-// ticket carries a full shipment; the IAC certification does not.
-export const AXIS_SUBMITTABLE_TYPES = new Set(["dhl-sameday-ticket"]);
+// Document types we know how to turn into an Axis order. Dispatch / pickup
+// tickets carry a full shipment; the IAC certifications do not.
+export const AXIS_SUBMITTABLE_TYPES = new Set([
+  "dhl-sameday-ticket",
+  "ait-pickup-order",
+]);
 
 /**
  * Workflow that produced the order:
@@ -223,6 +226,123 @@ function airlineDeliveryInstr(
   return lines.length ? lines.join("\n") : undefined;
 }
 
+// "USATL = Atlanta, United States" -> "USATL" (the leading airport code).
+function airportCode(value: string | null): string | null {
+  if (!value) return null;
+  const code = value.split("=")[0].trim();
+  return code || null;
+}
+
+// "USATL->PRSJU via DL1946 / 22-Jun" from an AIT ticket's routing fields.
+function summarizeAitRouting(mapping: DocumentMapping): string | null {
+  const origin = airportCode(field(mapping, "Origin"));
+  const dest = airportCode(field(mapping, "Destination"));
+  const flight = field(mapping, "Flight / Date");
+  const route = origin && dest ? `${origin}->${dest}` : origin || dest || null;
+  if (!route && !flight) return null;
+  return [route, flight ? `via ${flight}` : null].filter(Boolean).join(" ");
+}
+
+/**
+ * Build a v4 SubmitOrders request from an AIT Worldwide Logistics "Pickup
+ * Order". Unlike the DHL air-tender flow, the ticket already names the airline
+ * counter as its DELIVER TO, so the pickup and delivery are used exactly as
+ * printed — no cargo-hub redirect and no IAC.
+ */
+function aitPickupToAxisOrder(
+  mapping: DocumentMapping,
+  defaults: AxisOrderDefaults,
+): SubmitOrderV4Request {
+  const pickup = parseAddressBlock(field(mapping, "Pickup Name and Address"));
+  const delivery = parseAddressBlock(field(mapping, "Deliver To Name and Address"));
+
+  const shipment = field(mapping, "Shipment Number");
+  const mawb = field(mapping, "MAWB");
+  const orderRef = field(mapping, "Order Ref");
+  const consol = field(mapping, "Consol Number");
+  const flightDate = field(mapping, "Flight / Date");
+
+  const order: SubmitOrderV4Request = {
+    OrderType: defaults.orderType ?? "PD",
+    AccountNo: defaults.accountNo,
+    ServiceId: defaults.serviceId,
+    VehicleId: defaults.vehicleId,
+    Caller: defaults.caller,
+
+    // Reference numbers. AIT asks that its shipment # be on all billing, so it
+    // leads as Ref#1; the master airbill, order ref and consol follow.
+    ClientRefNo: shipment ?? mawb ?? undefined,
+    ClientRefNo2: mawb ?? undefined,
+    ClientRefNo3: orderRef ?? undefined,
+    ClientRefNo4: consol ?? undefined,
+
+    // Pickup = the ticket's PICKUP block.
+    PCoName: pickup.coName,
+    PContact: pickup.contact,
+    PPhone: pickup.phone,
+    PStreet: pickup.street,
+    PStreet2: pickup.street2,
+    PCity: pickup.city,
+    PState: pickup.state,
+    PZip: pickup.zip,
+    PSpecInstr: pickup.extra,
+
+    // Delivery = the ticket's DELIVER TO block (already the airline counter).
+    DCoName: delivery.coName,
+    DContact: delivery.contact,
+    DPhone: delivery.phone,
+    DStreet: delivery.street,
+    DStreet2: delivery.street2,
+    DCity: delivery.city,
+    DState: delivery.state,
+    DZip: delivery.zip,
+    DSpecInstr: joinInstr([
+      delivery.extra,
+      flightDate ? `Flight ${flightDate}` : null,
+      mawb ? `MAWB ${mawb}` : null,
+    ]),
+
+    SpecInstr: joinInstr([
+      field(mapping, "Goods Description"),
+      summarizeAitRouting(mapping),
+      field(mapping, "Ready") ? `Ready ${field(mapping, "Ready")}` : null,
+    ]),
+  };
+
+  // Weight / dimensions live on a package item, which needs a package-type id.
+  const piece = num(field(mapping, "Pieces"));
+  const weight = num(field(mapping, "Gross Weight (lb)"));
+  const dims = parseDimensions(field(mapping, "Dimensions (in)"));
+  const hasCargo = weight !== undefined || dims.length !== undefined;
+  if (defaults.packageId !== undefined && hasCargo) {
+    const item: OrderPackageItemV4 = {
+      PackageId: defaults.packageId,
+      Leg_PD: true,
+      Count: piece,
+      RefNo: mawb ?? shipment ?? undefined,
+      Weight: weight,
+      Length: dims.length,
+      Width: dims.width,
+      Height: dims.height,
+    };
+    order.OrderPackageItems = [item];
+  } else if (hasCargo) {
+    order.SpecInstr = joinInstr([
+      order.SpecInstr,
+      piece ? `${piece} pc` : null,
+      weight ? `${weight} lb` : null,
+      field(mapping, "Dimensions (in)")
+        ? `${field(mapping, "Dimensions (in)")} in`
+        : null,
+    ]);
+  }
+
+  // Strip undefined keys so the payload only carries what we actually have.
+  return Object.fromEntries(
+    Object.entries(order).filter(([, v]) => v !== undefined),
+  ) as unknown as SubmitOrderV4Request;
+}
+
 /**
  * Build a v4 SubmitOrders request from a recognised document mapping, or null
  * when the document type can't become an order.
@@ -232,6 +352,9 @@ export function mappingToAxisOrder(
   defaults: AxisOrderDefaults,
 ): SubmitOrderV4Request | null {
   if (!AXIS_SUBMITTABLE_TYPES.has(mapping.type)) return null;
+  if (mapping.type === "ait-pickup-order") {
+    return aitPickupToAxisOrder(mapping, defaults);
+  }
 
   const pickup = parseAddressBlock(field(mapping, "Shipper Name and Address"));
   const delivery = parseAddressBlock(field(mapping, "Consignee Name and Address"));

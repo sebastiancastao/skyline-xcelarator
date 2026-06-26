@@ -60,8 +60,9 @@ function downloadName(path: string) {
 type Carrier = "southwest" | "delta";
 // Drop-zone workflow. Southwest/Delta are air-tender (fill AWB/IAC, redirect
 // delivery to the airline counter); "normal" is a plain pickup -> delivery
-// order with the ticket's actual addresses and no AWB/IAC.
-type Workflow = Carrier | "normal";
+// order with the ticket's actual addresses and no AWB/IAC; "ait" submits an AIT
+// Worldwide Logistics Pickup Order as-is (no AWB/IAC).
+type Workflow = Carrier | "normal" | "ait";
 
 // Download name for the filled PDF, by carrier workflow. Southwest yields the
 // merged Air Waybill + IAC; Delta yields the IAC only. For Southwest we name the
@@ -125,7 +126,10 @@ function downloadBlob(blob: Blob, filename: string) {
 
 // Document types that can be submitted to the Skyline Axis API as a new
 // shipment/order. Keep in sync with AXIS_SUBMITTABLE_TYPES in lib/axis-map.
-const AXIS_SUBMITTABLE_TYPES = new Set(["dhl-sameday-ticket"]);
+const AXIS_SUBMITTABLE_TYPES = new Set([
+  "dhl-sameday-ticket",
+  "ait-pickup-order",
+]);
 
 function canSubmitAxis(result: FileResult): result is FillableResult {
   return Boolean(
@@ -239,12 +243,13 @@ export default function Home() {
   const [results, setResults] = useState<FileResult[]>([]);
   // Workflow of the most recent upload, set by which drop zone was used.
   const [workflow, setWorkflow] = useState<Workflow>("southwest");
-  // Air-tender workflows fill AWB/IAC; "normal" doesn't. The PDF-fill helpers
-  // only accept a Carrier, so map "normal" onto a harmless default (unused, as
-  // the fill UI is hidden for normal orders).
-  const isAirTender = workflow !== "normal";
+  // Air-tender workflows (Southwest/Delta) fill AWB/IAC and redirect delivery to
+  // the airline counter. "normal" and "ait" don't fill anything; the PDF-fill
+  // helpers only accept a Carrier, so map them onto a harmless default (unused,
+  // as the fill UI is hidden for those workflows).
+  const isAirTender = workflow === "southwest" || workflow === "delta";
   const carrier: Carrier = workflow === "delta" ? "delta" : "southwest";
-  const axisMode: AxisMode = workflow === "normal" ? "normal" : "air-tender";
+  const axisMode: AxisMode = isAirTender ? "air-tender" : "normal";
 
   const handleFiles = useCallback(
     async (picked: PickedFile[], chosen: Workflow) => {
@@ -342,7 +347,7 @@ export default function Home() {
         </p>
       </header>
 
-      <div className="grid gap-4 sm:grid-cols-3">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <DropZone
           title="Southwest"
           subtitle="Fills Air Waybill + IAC"
@@ -357,6 +362,11 @@ export default function Home() {
           title="Normal order"
           subtitle="Pickup → delivery as-is (no AWB/IAC)"
           onFiles={(picked) => handleFiles(picked, "normal")}
+        />
+        <DropZone
+          title="AIT"
+          subtitle="Submit AIT Pickup Order (no IAC)"
+          onFiles={(picked) => handleFiles(picked, "ait")}
         />
       </div>
 
