@@ -660,11 +660,320 @@ const AIT_PICKUP_ORDER: DocumentDefinition = {
   },
 };
 
+// --- ICAT Logistics "Routing Alert" -----------------------------------------
+//
+// A dispatch ticket ICAT Logistics sends to its local courier (Skyline). It
+// carries the full local job — where to pick up, the cargo, the airline the
+// shipment is tendered to, and the ultimate consignee — laid out as a dense
+// two-column form. The flattened text interleaves the columns, so extraction
+// works off the positional layout (the page that holds "ROUTING ALERT").
+
+// Index of the first row on the page that contains a cell matching `re`.
+function icatRowIndex(page: PageLayout, re: RegExp): number {
+  return page.findIndex((row) => row.some((c) => re.test(c.text)));
+}
+
+// The cell immediately to the right of the first cell whose text matches
+// `labelRe`, scanned across every row; null when the label or its value is
+// absent. An optional minimum x restricts the value to a given column.
+function icatValueAfter(
+  page: PageLayout,
+  labelRe: RegExp,
+  minX = -Infinity,
+): string | null {
+  for (const row of page) {
+    const i = row.findIndex((c) => labelRe.test(c.text));
+    if (i < 0) continue;
+    const next = row[i + 1];
+    if (next && next.x >= minX) return cleanValue(next.text);
+    return null;
+  }
+  return null;
+}
+
+// The cell to the right of `labelRe` as a money value, with the dots preserved
+// (cleanValue strips them as form-blank fillers). Null unless the cell holds a
+// number, so a stray wrapped label on the same row isn't mistaken for a value.
+function icatMoneyAfter(
+  page: PageLayout,
+  labelRe: RegExp,
+  minX = -Infinity,
+): string | null {
+  for (const row of page) {
+    const i = row.findIndex((c) => labelRe.test(c.text));
+    if (i < 0) continue;
+    const next = row[i + 1];
+    if (!next || next.x < minX || !/\d/.test(next.text)) return null;
+    return next.text.replace(/[^\d.,]/g, "").replace(/[.,]$/, "") || null;
+  }
+  return null;
+}
+
+// The text of cells whose x is in [minX, maxX) across rows [from, to), top to
+// bottom and left to right — used to read one column of a two-column block.
+function icatColumnLines(
+  page: PageLayout,
+  from: number,
+  to: number,
+  minX: number,
+  maxX: number,
+): string[] {
+  const lines: string[] = [];
+  for (let i = from; i < to && i < page.length; i++) {
+    for (const c of page[i]) {
+      if (c.x >= minX && c.x < maxX) lines.push(c.text);
+    }
+  }
+  return lines;
+}
+
+// Compose an address column into the multi-line block parseAddressBlock reads:
+// name / street(s) / "City ST ZIP", with contact and phone as Attn:/Tel: lines.
+function composeIcatAddress(
+  lines: string[],
+  contact: string | null,
+  phone: string | null,
+): string | null {
+  const out = lines.map((l) => l.trim()).filter(Boolean);
+  if (contact) out.push(`Attn: ${contact}`);
+  if (phone) out.push(`Tel: ${phone}`);
+  return out.length ? out.join("\n") : null;
+}
+
+const ICAT_ROUTING_ALERT: DocumentDefinition = {
+  type: "icat-routing-alert",
+  label: "ICAT Logistics Routing Alert",
+  match: ({ text, fileName }) => {
+    const flat = flatten(text).toLowerCase();
+    const name = fileName.toLowerCase();
+    let score = 0;
+    if (/routing alert/.test(flat)) score += 0.5;
+    if (/icat logistics/.test(flat)) score += 0.3;
+    if (/must drop at linehaul\/airline by/.test(flat)) score += 0.2;
+    if (/\bhawb\b/.test(flat) && /\bmawb\b/.test(flat)) score += 0.1;
+    if (/routing\s*alert/.test(name) && /icat/.test(name)) score += 0.2;
+    return Math.min(score, 1);
+  },
+  extract: ({ layout }) => {
+    const page = findPage(layout, /ROUTING ALERT/i);
+    const blank = (labels: string[]): MappedField[] =>
+      labels.map((label) => ({ label, value: null }));
+    const labels = [
+      "HAWB Number", "MAWB Number", "Shipper Reference", "Service Level",
+      "Service Code", "Pickup Name and Address", "Consignee Name and Address",
+      "Shipper Name and Address", "Ultimate Destination", "Linehaul/Airline",
+      "Carrier", "Flight Number", "Origin Airport", "Destination Airport",
+      "ETD", "ETA", "Must Drop By", "A/L Service Level", "A/L Account #",
+      "Shipment Date", "Ready", "Close", "Pieces", "Package Type",
+      "Gross Weight (lb)", "Dimensions (in)", "Description", "Declared Value",
+      "Pick-up Charges Expected", "Requested By", "ICAT Location",
+      "Shipper Known", "Instructions",
+    ];
+    if (!page) return blank(labels);
+
+    // Section anchors. Row order is stable but indices shift between tickets
+    // (optional instruction lines, wrapped foreign addresses), so read relative
+    // to these rather than hard-coding row numbers.
+    const pickIdx = icatRowIndex(page, /^Pick-up at:/);
+    const shipDateIdx = icatRowIndex(page, /^Shipment Date/);
+    // The cargo header spans several cells, so match the whole row's text.
+    const cargoHdrIdx = page.findIndex((r) =>
+      /Pieces.*WEIGHT.*DIMENSIONS/.test(rowText(r)),
+    );
+    const consigneeIdx = icatRowIndex(page, /^Consignee:/);
+    const linehaulIdx = icatRowIndex(page, /^Linehaul\/Airline:/);
+
+    // Pick-up block: the left column (x 70–335) between "Pick-up at:" and
+    // "Shipment Date:"; contact name sits to the right on the "Pick-up at:" row,
+    // and the contact phone is the right-column value on a "Phone # :" row.
+    const pickEnd = shipDateIdx > pickIdx ? shipDateIdx : page.length;
+    const pickupLines =
+      pickIdx >= 0 ? icatColumnLines(page, pickIdx, pickEnd, 70, 335) : [];
+    const pickupContact =
+      pickIdx >= 0
+        ? cleanValue(page[pickIdx].find((c) => c.x >= 440)?.text ?? null)
+        : null;
+    let pickupPhone: string | null = null;
+    for (let i = pickIdx; i >= 0 && i < pickEnd; i++) {
+      const row = page[i];
+      const j = row.findIndex((c) => c.x >= 335 && /^Phone\s*#/.test(c.text));
+      if (j >= 0 && row[j + 1]) {
+        pickupPhone = cleanValue(row[j + 1].text);
+        break;
+      }
+    }
+
+    // Consignee block (MAWB ROUTING): the right column (x ≥ 340) from the
+    // "Consignee:" row down to "Linehaul/Airline:", with the "Phone:" value
+    // pulled out as a Tel: line rather than a stray street line.
+    const consEnd = linehaulIdx > consigneeIdx ? linehaulIdx : page.length;
+    const consigneeLines: string[] = [];
+    let consigneePhone: string | null = null;
+    for (let i = consigneeIdx; i >= 0 && i < consEnd; i++) {
+      const row = page[i];
+      const phoneIdx = row.findIndex((c) => /^Phone:/i.test(c.text));
+      row.forEach((c, k) => {
+        if (c.x < 340) return;
+        if (phoneIdx >= 0 && k === phoneIdx + 1) {
+          consigneePhone = cleanValue(c.text);
+          return;
+        }
+        consigneeLines.push(c.text);
+      });
+    }
+
+    // Shipper block (MAWB ROUTING): the left column (x 70–309) over the same
+    // rows. Display-only — the actual pickup is the "Pick-up at:" block above.
+    const shipperLines =
+      consigneeIdx >= 0
+        ? icatColumnLines(page, consigneeIdx, consEnd, 70, 309)
+        : [];
+
+    // Cargo line beneath the "Pieces WEIGHT DIMENSIONS DESCRIPTION" header:
+    // "<pieces> <type> <weight> <L> x <W> x <H> <description>".
+    const cargoRow =
+      cargoHdrIdx >= 0 && page[cargoHdrIdx + 1]
+        ? page[cargoHdrIdx + 1].map((c) => c.text).join(" ")
+        : "";
+    const cargo = cargoRow.match(
+      /^\s*(\d+)\s+([A-Za-z]+)\s+([\d.]+)\s+(\d+)\s*x\s*(\d+)\s*x\s*(\d+)\s*(.*)$/i,
+    );
+
+    // Flight routing: the data row beneath the "Carrier: Flight #: …" header,
+    // split into columns. Keys are trimmed so trailing spaces don't break them.
+    const routeRaw = rowColumns(
+      page,
+      /Carrier:.*Flight #:.*Origin:.*Dest:.*ETD:.*ETA:/,
+    );
+    const route: Record<string, string> = {};
+    for (const [k, v] of Object.entries(routeRaw)) route[k.trim()] = v;
+
+    // Service level row: short code (e.g. "NF") then descriptive ("Next Flight
+    // Out"); keep both.
+    const slRow = page.find((r) => r.some((c) => /^Service Level:/.test(c.text)));
+    let serviceCode: string | null = null;
+    let serviceLevel: string | null = null;
+    if (slRow) {
+      const i = slRow.findIndex((c) => /^Service Level:/.test(c.text));
+      const after = slRow.slice(i + 1);
+      serviceCode = cleanValue(after[0]?.text ?? null);
+      serviceLevel = cleanValue(
+        (after.length > 1 ? after.slice(1) : after).map((c) => c.text).join(" "),
+      );
+    }
+
+    // "Ready: 1:30 PM To 4:00 PM" arrives as a single cell; strip the label.
+    const readyCell = page
+      .flatMap((r) => r)
+      .find((c) => /^Ready:/.test(c.text));
+    const ready = readyCell
+      ? cleanValue(readyCell.text.replace(/^Ready:\s*/, ""))
+      : null;
+
+    // Instructions: the left-column lines between "Instructions:" and the
+    // standing "Please contact local ICAT office" footer.
+    const instrIdx = icatRowIndex(page, /^Instructions:/);
+    const footerIdx = icatRowIndex(page, /Please contact local ICAT/);
+    const instructions =
+      instrIdx >= 0
+        ? cleanValue(
+            icatColumnLines(
+              page,
+              instrIdx + 1,
+              footerIdx > instrIdx ? footerIdx : page.length,
+              -Infinity,
+              335,
+            ).join(" "),
+          )
+        : null;
+
+    const shipperKnown =
+      page.flatMap((r) => r).find((c) => /\(Shipper is( not)? known\)/i.test(c.text))
+        ?.text ?? null;
+
+    return [
+      { label: "HAWB Number", value: icatValueAfter(page, /^HAWB # :/, 440) },
+      { label: "MAWB Number", value: icatValueAfter(page, /^MAWB#:/) },
+      {
+        label: "Shipper Reference",
+        value: icatValueAfter(page, /^Shipper Reference/, 440),
+      },
+      { label: "Service Level", value: serviceLevel },
+      { label: "Service Code", value: serviceCode },
+      {
+        label: "Pickup Name and Address",
+        value: composeIcatAddress(pickupLines, pickupContact, pickupPhone),
+      },
+      {
+        label: "Consignee Name and Address",
+        value: composeIcatAddress(consigneeLines, null, consigneePhone),
+      },
+      {
+        label: "Shipper Name and Address",
+        value: composeIcatAddress(shipperLines, null, null),
+      },
+      {
+        label: "Ultimate Destination",
+        value: icatValueAfter(page, /^Ultimate Dest:/, 440),
+      },
+      {
+        label: "Linehaul/Airline",
+        value: icatValueAfter(page, /^Linehaul\/Airline:/),
+      },
+      { label: "Carrier", value: cleanValue(route["Carrier:"] ?? null) },
+      { label: "Flight Number", value: cleanValue(route["Flight #:"] ?? null) },
+      { label: "Origin Airport", value: cleanValue(route["Origin:"] ?? null) },
+      { label: "Destination Airport", value: cleanValue(route["Dest:"] ?? null) },
+      { label: "ETD", value: cleanValue(route["ETD:"] ?? null) },
+      { label: "ETA", value: cleanValue(route["ETA:"] ?? null) },
+      {
+        label: "Must Drop By",
+        value: icatValueAfter(page, /^Must drop at linehaul\/airline by:/),
+      },
+      {
+        label: "A/L Service Level",
+        value: icatValueAfter(page, /^A\/L Svc Level:/, 440),
+      },
+      { label: "A/L Account #", value: icatValueAfter(page, /^A\/L Acct #:/) },
+      {
+        label: "Shipment Date",
+        value: icatValueAfter(page, /^Shipment Date:/),
+      },
+      { label: "Ready", value: ready },
+      { label: "Close", value: icatValueAfter(page, /^Close:/, 440) },
+      { label: "Pieces", value: cargo ? cargo[1] : null },
+      { label: "Package Type", value: cargo ? cargo[2] : null },
+      { label: "Gross Weight (lb)", value: cargo ? cargo[3] : null },
+      {
+        label: "Dimensions (in)",
+        value: cargo ? `${cargo[4]} x ${cargo[5]} x ${cargo[6]}` : null,
+      },
+      {
+        label: "Description",
+        value: cargo ? cargo[7].replace(/\s+/g, " ").trim() || null : null,
+      },
+      {
+        label: "Declared Value",
+        value: icatMoneyAfter(page, /^Declared Value \$:/, 440),
+      },
+      {
+        label: "Pick-up Charges Expected",
+        value: icatMoneyAfter(page, /^Pick-up Charges Expected/),
+      },
+      { label: "Requested By", value: icatValueAfter(page, /^Requested\b/, 60) },
+      { label: "ICAT Location", value: icatValueAfter(page, /^Location:/) },
+      { label: "Shipper Known", value: cleanValue(shipperKnown) },
+      { label: "Instructions", value: instructions },
+    ];
+  },
+};
+
 const DEFINITIONS: DocumentDefinition[] = [
   DHL_IAC,
   AWB_GUIDE,
   DHL_SAMEDAY_TICKET,
   AIT_PICKUP_ORDER,
+  ICAT_ROUTING_ALERT,
 ];
 
 const MIN_CONFIDENCE = 0.5;

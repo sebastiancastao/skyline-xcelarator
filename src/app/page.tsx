@@ -61,8 +61,9 @@ type Carrier = "southwest" | "delta";
 // Drop-zone workflow. Southwest/Delta are air-tender (fill AWB/IAC, redirect
 // delivery to the airline counter); "normal" is a plain pickup -> delivery
 // order with the ticket's actual addresses and no AWB/IAC; "ait" submits an AIT
-// Worldwide Logistics Pickup Order as-is (no AWB/IAC).
-type Workflow = Carrier | "normal" | "ait";
+// Worldwide Logistics Pickup Order as-is (no AWB/IAC); "icat" submits an ICAT
+// Logistics Routing Alert as-is (no AWB/IAC).
+type Workflow = Carrier | "normal" | "ait" | "icat";
 
 // Download name for the filled PDF, by carrier workflow. Southwest yields the
 // merged Air Waybill + IAC; Delta yields the IAC only. For Southwest we name the
@@ -129,6 +130,7 @@ function downloadBlob(blob: Blob, filename: string) {
 const AXIS_SUBMITTABLE_TYPES = new Set([
   "dhl-sameday-ticket",
   "ait-pickup-order",
+  "icat-routing-alert",
 ]);
 
 function canSubmitAxis(result: FileResult): result is FillableResult {
@@ -347,7 +349,7 @@ export default function Home() {
         </p>
       </header>
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         <DropZone
           title="Southwest"
           subtitle="Fills Air Waybill + IAC"
@@ -367,6 +369,11 @@ export default function Home() {
           title="AIT"
           subtitle="Submit AIT Pickup Order (no IAC)"
           onFiles={(picked) => handleFiles(picked, "ait")}
+        />
+        <DropZone
+          title="ICAT"
+          subtitle="Submit ICAT Routing Alert (no IAC)"
+          onFiles={(picked) => handleFiles(picked, "icat")}
         />
       </div>
 
