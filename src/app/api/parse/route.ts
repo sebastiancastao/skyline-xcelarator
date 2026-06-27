@@ -508,6 +508,6 @@ export async function POST(req: NextRequest) {
     file,
     name: paths[i] || file.name,
   }));
-  const results = await mapLimit(inputs, CONCURRENCY, parseFile);
+  const results = (await mapLimit(inputs, CONCURRENCY, parseFile)).flat();
   return NextResponse.json({ results });
 }
