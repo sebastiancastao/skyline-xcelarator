@@ -62,8 +62,9 @@ type Carrier = "southwest" | "delta";
 // delivery to the airline counter); "normal" is a plain pickup -> delivery
 // order with the ticket's actual addresses and no AWB/IAC; "ait" submits an AIT
 // Worldwide Logistics Pickup Order as-is (no AWB/IAC); "icat" submits an ICAT
-// Logistics Routing Alert as-is (no AWB/IAC).
-type Workflow = Carrier | "normal" | "ait" | "icat";
+// Logistics Routing Alert as-is (no AWB/IAC); "cap" submits a C.A.P. Logistics
+// Alert as-is (no AWB/IAC).
+type Workflow = Carrier | "normal" | "ait" | "icat" | "cap";
 
 // Download name for the filled PDF, by carrier workflow. Southwest yields the
 // merged Air Waybill + IAC; Delta yields the IAC only. For Southwest we name the
@@ -131,6 +132,7 @@ const AXIS_SUBMITTABLE_TYPES = new Set([
   "dhl-sameday-ticket",
   "ait-pickup-order",
   "icat-routing-alert",
+  "cap-logistics",
 ]);
 
 function canSubmitAxis(result: FileResult): result is FillableResult {
@@ -374,6 +376,11 @@ export default function Home() {
           title="ICAT"
           subtitle="Submit ICAT Routing Alert (no IAC)"
           onFiles={(picked) => handleFiles(picked, "icat")}
+        />
+        <DropZone
+          title="CAP"
+          subtitle="Submit CAP Logistics Alert (no IAC)"
+          onFiles={(picked) => handleFiles(picked, "cap")}
         />
       </div>
 

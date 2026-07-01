@@ -15,6 +15,7 @@ export const AXIS_SUBMITTABLE_TYPES = new Set([
   "dhl-sameday-ticket",
   "ait-pickup-order",
   "icat-routing-alert",
+  "cap-logistics",
 ]);
 
 /**
@@ -461,6 +462,125 @@ function icatRoutingAlertToAxisOrder(
   ) as unknown as SubmitOrderV4Request;
 }
 
+// "ATL->MAF via SOUTHWEST AIRLINES 2007" from a CAP alert's routing fields.
+function summarizeCapRouting(mapping: DocumentMapping): string | null {
+  const origin = field(mapping, "Origin Airport");
+  const dest = field(mapping, "Destination Airport");
+  const via = [field(mapping, "Airline"), field(mapping, "Flight Number")]
+    .filter(Boolean)
+    .join(" ");
+  const route = origin && dest ? `${origin}->${dest}` : origin || dest || null;
+  if (!route && !via) return null;
+  return [route, via ? `via ${via}` : null].filter(Boolean).join(" ");
+}
+
+/**
+ * Build a v4 SubmitOrders request from a C.A.P. Logistics "Alert". CAP
+ * dispatches its local courier (Skyline) to move a shipment to or from an
+ * airline; either the "Pickup at" or the "Deliver to" block is the airline
+ * counter and the other is the real shipper/consignee. The Axis order keeps
+ * both stops exactly as printed — no cargo-hub redirect and no IAC — carrying
+ * the airline, flight, AWB and "delivery by" cutoff in the delivery
+ * instructions.
+ */
+function capLogisticsToAxisOrder(
+  mapping: DocumentMapping,
+  defaults: AxisOrderDefaults,
+): SubmitOrderV4Request {
+  const pickup = parseAddressBlock(field(mapping, "Pickup Name and Address"));
+  const delivery = parseAddressBlock(field(mapping, "Deliver To Name and Address"));
+
+  const tracking = field(mapping, "Tracking Number");
+  const awb = field(mapping, "Air Waybill Number");
+  const po = field(mapping, "PO Number");
+  const airline = field(mapping, "Airline");
+  const flight = field(mapping, "Flight Number");
+  const etdEta = field(mapping, "Flight ETD/ETA");
+  const readyAt = field(mapping, "Ready At");
+  const deliveryBy = field(mapping, "Delivery By");
+
+  const order: SubmitOrderV4Request = {
+    OrderType: defaults.orderType ?? "PD",
+    AccountNo: defaults.accountNo,
+    ServiceId: defaults.serviceId,
+    VehicleId: defaults.vehicleId,
+    Caller: defaults.caller,
+
+    // Reference numbers: CAP's tracking # leads, then the airline AWB and the
+    // customer PO / work-order (WJ) reference.
+    ClientRefNo: tracking ?? awb ?? undefined,
+    ClientRefNo2: awb ?? undefined,
+    ClientRefNo3: po ?? undefined,
+
+    // Pickup = the "Pickup at" block.
+    PCoName: pickup.coName,
+    PContact: pickup.contact,
+    PPhone: pickup.phone,
+    PStreet: pickup.street,
+    PStreet2: pickup.street2,
+    PCity: pickup.city,
+    PState: pickup.state,
+    PZip: pickup.zip,
+    PSpecInstr: joinInstr([pickup.extra, readyAt ? `Ready ${readyAt}` : null]),
+
+    // Delivery = the "Deliver to" block, as printed.
+    DCoName: delivery.coName,
+    DContact: delivery.contact,
+    DPhone: delivery.phone,
+    DStreet: delivery.street,
+    DStreet2: delivery.street2,
+    DCity: delivery.city,
+    DState: delivery.state,
+    DZip: delivery.zip,
+    DSpecInstr: joinInstr([
+      delivery.extra,
+      airline ? `Airline ${airline}` : null,
+      flight ? `Flight ${flight}` : null,
+      etdEta,
+      awb ? `AWB ${awb}` : null,
+      deliveryBy ? `Deliver by ${deliveryBy}` : null,
+    ]),
+
+    SpecInstr: joinInstr([
+      field(mapping, "Commodity Description"),
+      summarizeCapRouting(mapping),
+      field(mapping, "Requirements"),
+      field(mapping, "Special Instructions"),
+    ]),
+  };
+
+  // Weight lives on a package item, which needs a package-type id. CAP alerts
+  // carry a total weight but no dimensions.
+  const piece = num(field(mapping, "Total Pieces"));
+  const weight = num(field(mapping, "Total Weight (lb)"));
+  const dims = parseDimensions(field(mapping, "Dimensions (in)"));
+  const hasCargo = weight !== undefined || dims.length !== undefined;
+  if (defaults.packageId !== undefined && hasCargo) {
+    const item: OrderPackageItemV4 = {
+      PackageId: defaults.packageId,
+      Leg_PD: true,
+      Count: piece,
+      RefNo: awb ?? tracking ?? undefined,
+      Weight: weight,
+      Length: dims.length,
+      Width: dims.width,
+      Height: dims.height,
+    };
+    order.OrderPackageItems = [item];
+  } else if (hasCargo) {
+    order.SpecInstr = joinInstr([
+      order.SpecInstr,
+      piece ? `${piece} pc` : null,
+      weight ? `${weight} lb` : null,
+    ]);
+  }
+
+  // Strip undefined keys so the payload only carries what we actually have.
+  return Object.fromEntries(
+    Object.entries(order).filter(([, v]) => v !== undefined),
+  ) as unknown as SubmitOrderV4Request;
+}
+
 /**
  * Build a v4 SubmitOrders request from a recognised document mapping, or null
  * when the document type can't become an order.
@@ -475,6 +595,9 @@ export function mappingToAxisOrder(
   }
   if (mapping.type === "icat-routing-alert") {
     return icatRoutingAlertToAxisOrder(mapping, defaults);
+  }
+  if (mapping.type === "cap-logistics") {
+    return capLogisticsToAxisOrder(mapping, defaults);
   }
 
   const pickup = parseAddressBlock(field(mapping, "Shipper Name and Address"));

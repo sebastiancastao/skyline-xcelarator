@@ -968,12 +968,226 @@ const ICAT_ROUTING_ALERT: DocumentDefinition = {
   },
 };
 
+// --- C.A.P. Logistics "Alert" dispatch order ---------------------------------
+//
+// A dispatch ticket C.A.P. Air Freight (Cap Logistics) sends to its local
+// courier (Skyline) to move a shipment to or from an airline. The "ALERT"
+// carries the full local job as a dense multi-column form: a "Pickup at" block
+// and a "Deliver to" block — one of which is the airline (Flight#, ETD/ETA and
+// the pre-booked AWB) — the requested times, the cargo, and a "sample airline
+// bill" with the routing legs. The flattened text interleaves the columns, so
+// extraction works off the positional layout of page 1 (the page that holds
+// "ALERT - Page 1 of"). Reuses the generic column helpers defined above.
+
+// Compose one address column of the CAP alert (the lines between the "Pickup
+// at:"/"Deliver to:" header and the "Required:" row) into the multi-line block
+// parseAddressBlock reads: name / street(s) / "City, ST ZIP". The airline flight
+// lines are dropped (captured as dedicated fields), Contact/Phone become
+// Attn:/Tel: lines, and the trailing domestic country ("US"/"USA") is dropped.
+function composeCapAddress(lines: string[]): string | null {
+  const out: string[] = [];
+  for (const raw of lines) {
+    let line = raw.trim();
+    if (!line) continue;
+    if (/^(Pickup at:|Deliver to:|Ready at:|Closes at:)$/i.test(line)) continue;
+    if (/^(Flight#|ETD|ETA|AWB):/i.test(line)) continue; // dedicated fields below
+    const contact = line.match(/^Contact:\s*(.*)$/i);
+    if (contact) {
+      if (contact[1].trim()) out.push(`Attn: ${contact[1].trim()}`);
+      continue;
+    }
+    const phone = line.match(/^Phone:\s*(.*)$/i);
+    if (phone) {
+      if (phone[1].trim()) out.push(`Tel: ${phone[1].trim()}`);
+      continue;
+    }
+    line = line.replace(/\s+(US|USA)$/i, "");
+    out.push(line);
+  }
+  return out.length ? out.join("\n") : null;
+}
+
+// Parse the "sample airline bill" routing legs (carrier / flight-date / to),
+// which the flattened text stacks column-by-column. Read them from the layout
+// instead: each leg is a row holding a 2-letter carrier, a "flight/date" and a
+// 3-letter airport, e.g. "WN 2007/01 HOU".
+function capRoutingLegs(page: PageLayout): string[] {
+  const legs: string[] = [];
+  for (const row of page) {
+    const texts = row.map((c) => c.text);
+    const ci = texts.findIndex((t) => /^[A-Z]{2}$/.test(t));
+    if (ci < 0) continue;
+    const rest = texts.slice(ci + 1);
+    const fd = rest.find((t) => /^\d+\/\d+$/.test(t));
+    const to = rest.find((t) => /^[A-Z]{3}$/.test(t));
+    if (fd && to) legs.push(`${texts[ci]} ${fd} ${to}`);
+  }
+  return legs;
+}
+
+const CAP_LOGISTICS: DocumentDefinition = {
+  type: "cap-logistics",
+  label: "CAP Logistics Alert",
+  match: ({ text, fileName }) => {
+    const flat = flatten(text).toLowerCase();
+    const name = fileName.toLowerCase();
+    let score = 0;
+    if (/c\.?a\.?p\.? air freight/.test(flat)) score += 0.4;
+    if (/cap logistics|caplogistics\.com/.test(flat)) score += 0.3;
+    if (/cap station/.test(flat)) score += 0.2;
+    if (/alert - page \d+ of \d+/.test(flat)) score += 0.2;
+    if (/tracking#\s*\d{4}[a-z]\d+/.test(flat)) score += 0.1;
+    if (/\bcap\b/.test(name)) score += 0.2;
+    return Math.min(score, 1);
+  },
+  extract: ({ text, layout }) => {
+    const page = findPage(layout, /ALERT - Page 1 of/i);
+
+    // Flight tender time — "ETD: Jul 1 2026 6:20AM" (outbound) or "ETA: …"
+    // (inbound). Read from the text layer so it survives without positions.
+    const flightEta = flatten(text).match(
+      /(ET[DA]):\s*([A-Za-z]{3}\s+\d{1,2}\s+\d{4}\s+\d{1,2}:\d{2}\s*[AP]M)/i,
+    );
+
+    // Layout-only fields default to null so an OCR'd scan (no positional layout)
+    // still yields the text-layer fields below rather than nothing at all.
+    let localCourier: string | null = null;
+    let dispatcher: string | null = null;
+    let capStation: string | null = null;
+    let airline: string | null = null;
+    let direction: string | null = null;
+    let totalPieces: string | null = null;
+    let totalWeight: string | null = null;
+    let originAirport: string | null = null;
+    let destAirport: string | null = null;
+    let commodity: string | null = null;
+    let pickup: string | null = null;
+    let deliver: string | null = null;
+    let readyAt: string | null = null;
+    let deliveryBy: string | null = null;
+    let routing: string | null = null;
+    let requirements: string | null = null;
+    let specialInstr: string | null = null;
+
+    if (page) {
+      localCourier = icatValueAfter(page, /^Carrier:$/);
+      dispatcher = icatValueAfter(page, /^From:$/);
+      capStation = icatValueAfter(page, /^CAP Station$/);
+      airline = icatValueAfter(page, /^bill for Airline$/);
+      totalPieces = icatValueAfter(page, /^Total Pieces$/);
+      totalWeight = icatValueAfter(page, /^Total Weight$/);
+      originAirport = icatValueAfter(page, /^Airport of Departure$/);
+      destAirport = icatValueAfter(page, /^Airport of Destination$/);
+
+      // "Pickup"/"Delivery" banner near the top-right sets the job direction.
+      const dirCell = page
+        .flatMap((r) => r)
+        .find((c) => /^(Pickup|Delivery)$/.test(c.text) && c.x >= 260 && c.x <= 320);
+      direction = dirCell ? dirCell.text : null;
+
+      commodity = cleanValue(
+        rowColumns(page, /Commodity Description.*Pieces.*Weight/)[
+          "Commodity Description"
+        ] ?? null,
+      );
+
+      // Two-column pickup / deliver blocks between the "Pickup at:" header and
+      // the "Required:" row. The airline side (Flight#/ETD/AWB) collapses to
+      // just its name once those lines are pulled out as dedicated fields.
+      const hdrIdx = icatRowIndex(page, /^Pickup at:$/);
+      let stopIdx = icatRowIndex(page, /^Required:$/);
+      if (stopIdx < 0) stopIdx = page.length;
+      if (hdrIdx >= 0) {
+        pickup = composeCapAddress(
+          icatColumnLines(page, hdrIdx + 1, stopIdx, 118, 310),
+        );
+        deliver = composeCapAddress(
+          icatColumnLines(page, hdrIdx + 1, stopIdx, 310, 386),
+        );
+        // Ready time/date sit in the far-left column (excluding the labels).
+        readyAt = cleanValue(
+          icatColumnLines(page, hdrIdx + 1, stopIdx, -Infinity, 118)
+            .filter((t) => !/^(Ready at:|Closes at:)$/i.test(t))
+            .join(" "),
+        );
+        // Delivery-By deadline sits in the far-right column.
+        deliveryBy = cleanValue(
+          icatColumnLines(page, hdrIdx + 1, stopIdx, 386, Infinity).join(" "),
+        );
+      }
+
+      const legs = capRoutingLegs(page);
+      routing = legs.length ? legs.join(" · ") : null;
+
+      // Requirements: the left column of the "Required:" block down to the
+      // "Special" label (deduped — the form repeats the notes per column).
+      let specialIdx = icatRowIndex(page, /^Special$/);
+      if (specialIdx < 0) specialIdx = page.length;
+      if (stopIdx < page.length) {
+        const reqLines = icatColumnLines(page, stopIdx, specialIdx, 118, 310);
+        requirements = cleanValue([...new Set(reqLines)].join(" | "));
+      }
+
+      // Special instructions: the free-text block beneath the "Special
+      // Instructions" label, up to the standing footer notes.
+      let endIdx = icatRowIndex(
+        page,
+        /Pick up cannot be outsourced|PLEASE READ|Sample Airline/,
+      );
+      if (endIdx < 0) endIdx = page.length;
+      if (specialIdx < page.length) {
+        specialInstr = cleanValue(
+          icatColumnLines(page, specialIdx, endIdx, 90, 310).join(" "),
+        );
+      }
+    }
+
+    return [
+      { label: "Tracking Number", value: capture(text, /TRACKING#\s*([A-Z0-9]+)/i) },
+      { label: "Direction", value: direction },
+      { label: "Revised", value: capture(text, /\b(REVISED)\b/i) },
+      { label: "PO Number", value: capture(text, /PO:\s*(WJ\d+)/i) },
+      { label: "Local Courier", value: localCourier },
+      { label: "Dispatcher", value: dispatcher },
+      { label: "CAP Station", value: capStation },
+      { label: "Ready At", value: readyAt },
+      { label: "Delivery By", value: deliveryBy },
+      { label: "Pickup Name and Address", value: pickup },
+      { label: "Deliver To Name and Address", value: deliver },
+      { label: "Airline", value: airline },
+      { label: "Flight Number", value: capture(text, /Flight#:\s*(\d+)/i) },
+      {
+        label: "Flight ETD/ETA",
+        value: flightEta ? `${flightEta[1]} ${flightEta[2]}` : null,
+      },
+      { label: "Air Waybill Number", value: capture(text, /AWB:\s*(\d+)/i) },
+      { label: "Origin Airport", value: originAirport },
+      { label: "Destination Airport", value: destAirport },
+      { label: "Routing", value: routing },
+      { label: "Total Pieces", value: totalPieces },
+      { label: "Total Weight (lb)", value: totalWeight },
+      { label: "Commodity Description", value: commodity },
+      {
+        label: "CAP Account #",
+        value: capture(text, /\b(\d{5}-\d{3})(?!\d)/),
+      },
+      {
+        label: "IAC Number",
+        value: capture(text, /assigned by TSA is\s*([A-Z]{2}\d+)/i),
+      },
+      { label: "Requirements", value: requirements },
+      { label: "Special Instructions", value: specialInstr },
+    ];
+  },
+};
+
 const DEFINITIONS: DocumentDefinition[] = [
   DHL_IAC,
   AWB_GUIDE,
   DHL_SAMEDAY_TICKET,
   AIT_PICKUP_ORDER,
   ICAT_ROUTING_ALERT,
+  CAP_LOGISTICS,
 ];
 
 const MIN_CONFIDENCE = 0.5;
