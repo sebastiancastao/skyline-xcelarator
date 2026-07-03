@@ -12,9 +12,22 @@ import { ocrPdf, TEXT_THRESHOLD } from "@/lib/ocr";
 // PDF and EML parsing rely on Node APIs, so force the Node.js runtime.
 export const runtime = "nodejs";
 
-const MAX_BYTES = 25 * 1024 * 1024; // 25 MB per file
-const MAX_FILES = 500;
-const CONCURRENCY = 5; // parse this many files at once to cap memory use
+// Capacity limits, all overridable via environment variables so a deployment
+// can be tuned for larger batches without a code change:
+//   PARSE_MAX_FILES    — files accepted per upload   (default 2000)
+//   PARSE_CONCURRENCY  — files parsed in parallel     (default 12)
+//   PARSE_MAX_FILE_MB  — per-file size cap, in MB     (default 25)
+// Concurrency is the memory lever: text PDFs (most orders) parse cheaply, but a
+// scanned PDF spins up a Tesseract worker plus an upscaled page render, so dial
+// PARSE_CONCURRENCY back down if an OCR-heavy batch strains memory.
+function intEnv(name: string, fallback: number): number {
+  const n = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const MAX_BYTES = intEnv("PARSE_MAX_FILE_MB", 25) * 1024 * 1024;
+const MAX_FILES = intEnv("PARSE_MAX_FILES", 2000);
+const CONCURRENCY = intEnv("PARSE_CONCURRENCY", 12);
 
 // Run an async mapper over items with a bounded number of concurrent workers,
 // preserving input order in the results.
@@ -206,7 +219,7 @@ function tooLargeResult(fileSize: number, name: string): FileResult {
     ok: false,
     fileName: name,
     fileSize,
-    error: "File is too large (max 25 MB).",
+    error: `File is too large (max ${Math.round(MAX_BYTES / (1024 * 1024))} MB).`,
   };
 }
 
