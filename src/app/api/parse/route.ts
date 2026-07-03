@@ -508,6 +508,9 @@ export async function POST(req: NextRequest) {
     file,
     name: paths[i] || file.name,
   }));
-  const results = await mapLimit(inputs, CONCURRENCY, parseFile);
+  // parseFile returns an array per input (an EML can expand into several PDF
+  // attachments), so flatten to the flat FileResult[] the client expects.
+  const nested = await mapLimit(inputs, CONCURRENCY, parseFile);
+  const results = nested.flat();
   return NextResponse.json({ results });
 }
