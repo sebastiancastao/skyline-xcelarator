@@ -193,13 +193,17 @@ export function ticketToIacValues(
   }
 
   // Yes/No answers. "Any items under 16 oz (453.6 g)?" is a property of the
-  // shipment: weights are quoted in pounds, so anything ≥ 1 lb means No. The ID
-  // and TSA-certification checks are affirmative for a properly tendered load.
+  // shipment: weights are quoted in pounds, so anything ≥ 1 lb means No. The
+  // first ID and TSA-certification checks are affirmative for a properly
+  // tendered load.
   const weight = parseFloat(field("Gross Weight (lb)") ?? "");
   out["Items under 16 oz"] =
     Number.isFinite(weight) && weight >= 1 ? "No" : "Yes";
   out["Matching photo on ID (first)"] = "Yes";
-  out["Matching photo on ID (second)"] = "Yes";
+  // The 2nd Type of ID reviewed is "N/A" (the first ID is a government photo
+  // ID, so no second ID is collected) — with no second ID there's no photo to
+  // match, so this answer is "No".
+  out["Matching photo on ID (second)"] = "No";
   out["Evidence of TSA Certification"] = "Yes";
 
   return out;
